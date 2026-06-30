@@ -21,6 +21,8 @@ import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from nanollm.config import ModelConfig, TrainConfig
 from nanollm.model import NanoLLM
@@ -66,10 +68,23 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # DDP 初始化：torchrun 会注入 LOCAL_RANK；单卡直接跑时不存在该变量
+    ddp = "LOCAL_RANK" in os.environ
+    if ddp:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        dist.init_process_group("nccl")
+        device = f"cuda:{local_rank}"
+        torch.cuda.set_device(device)
+        is_main = local_rank == 0
+    else:
+        device = detect_device(args.device)
+        is_main = True
+
     set_seed(args.seed)
-    device = detect_device(args.device)
     dtype = get_dtype(args.dtype)
-    print(f"== device = {device}, dtype = {args.dtype} ==")
+    if is_main:
+        print(f"== device = {device}, dtype = {args.dtype} ==")
 
     # 1) tokenizer & model config
     tk = NanoTokenizer.load(args.tokenizer)
@@ -89,9 +104,14 @@ def main():
 
     # 2) model
     model = NanoLLM(mcfg).to(device)
-    n_total = model.num_parameters()
-    n_non_emb = model.num_parameters(exclude_embedding=True)
-    print(f"== params: total = {human_count(n_total)} | non-embedding = {human_count(n_non_emb)} ==")
+    if ddp:
+        model = DDP(model, device_ids=[local_rank])
+    raw_model = model.module if ddp else model  # 存 checkpoint 用原始模型
+
+    n_total = raw_model.num_parameters()
+    n_non_emb = raw_model.num_parameters(exclude_embedding=True)
+    if is_main:
+        print(f"== params: total = {human_count(n_total)} | non-embedding = {human_count(n_non_emb)} ==")
 
     # 3) optimizer
     optimizer = configure_optimizer(
@@ -149,22 +169,28 @@ def main():
         loss_accum = micro_loss * args.grad_accum_steps
         step += 1
 
-        if step % tcfg.log_interval == 0:
+        if is_main and step % tcfg.log_interval == 0:
             dt = time.time() - t0
-            tok_per_step = tcfg.batch_size * args.grad_accum_steps * tcfg.seq_len
+            # DDP 时每步总 token 数翻倍（每张卡各跑一个 batch）
+            world_size = dist.get_world_size() if ddp else 1
+            tok_per_step = tcfg.batch_size * args.grad_accum_steps * tcfg.seq_len * world_size
             tok_per_sec = tok_per_step * tcfg.log_interval / dt
             print(f"step {step:5d} | loss {loss_accum:7.4f} | lr {lr:.2e} "
                   f"| ppl {math.exp(min(20, loss_accum)):8.2f} | {tok_per_sec:,.0f} tok/s")
             t0 = time.time()
 
-        if step % tcfg.save_interval == 0 or step == tcfg.max_steps:
+        if is_main and (step % tcfg.save_interval == 0 or step == tcfg.max_steps):
             ckpt_path = os.path.join(tcfg.out_dir, f"pretrain_step{step}.pt")
-            save_checkpoint(ckpt_path, model, optimizer, step, mcfg)
+            save_checkpoint(ckpt_path, raw_model, optimizer, step, mcfg)
             print(f"  -> saved {ckpt_path}")
 
-    final_path = os.path.join(tcfg.out_dir, "pretrain_final.pt")
-    save_checkpoint(final_path, model, optimizer, step, mcfg)
-    print(f"\n训练完成 -> {final_path}")
+    if is_main:
+        final_path = os.path.join(tcfg.out_dir, "pretrain_final.pt")
+        save_checkpoint(final_path, raw_model, optimizer, step, mcfg)
+        print(f"\n训练完成 -> {final_path}")
+
+    if ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
